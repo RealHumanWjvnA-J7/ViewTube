@@ -149,16 +149,10 @@ let lastDiag = null;
 let lastQuery = '';
 const QUICK = ['lofi music','minecraft','cooking recipes','space exploration','piano covers','travel vlog','comedy','science explained'];
 
-// ── CORS proxy pool ───────────────────────────────────────────────────────────
-// These all wrap POST requests and add CORS headers
-const PROXIES = [
-  { name:'corsproxy.io',   fn: url => ({ url: `https://corsproxy.io/?${encodeURIComponent(url)}`, headers:{} }) },
-  { name:'cors.sh',        fn: url => ({ url: `https://proxy.cors.sh/${url}`, headers:{'x-cors-api-key':'temp'} }) },
-  { name:'crossorigin.me', fn: url => ({ url: `https://crossorigin.me/${url}`, headers:{} }) },
-  { name:'codetabs',       fn: url => ({ url: `https://api.codetabs.com/v1/proxy?quest=${url}`, headers:{} }) },
-];
+// ── Your Cloudflare Worker ────────────────────────────────────────────────────
+const WORKER_URL = 'https://fragrant-butterfly-475d.enderhayes82.workers.dev';
 
-// ── Invidious public instances (GET-based search, proper CORS headers) ────────
+// ── Invidious public instances (GET-based, fallback only) ─────────────────────
 const INVIDIOUS = [
   'https://invidious.privacyredirect.com',
   'https://inv.tux.pizza',
@@ -202,21 +196,19 @@ async function doSearch(){
   const diag={ts:new Date().toISOString(),query:q,attempts:[],successMethod:null,videoCount:null};
   lastDiag=diag;
 
-  // 1. Direct
-  setMsg('Connecting to YouTube…');
-  let r=await tryDirect(q,diag);
-  if(r)return finish(r,'direct',diag);
+  // 1. Cloudflare Worker (primary — server-side, no CORS issues)
+  setMsg('Searching…');
+  let r=await tryWorker(q,diag);
+  if(r)return finish(r,'worker',diag);
 
-  // 2. CORS proxies
-  for(const p of PROXIES){
-    setMsg(`Trying proxy: ${p.name}…`);
-    r=await tryYtProxy(q,p,diag);
-    if(r)return finish(r,'proxy',diag);
-  }
+  // 2. Direct (works if no CORS block on host)
+  setMsg('Trying direct connection…');
+  r=await tryDirect(q,diag);
+  if(r)return finish(r,'direct',diag);
 
   // 3. Invidious instances
   for(const inst of INVIDIOUS){
-    setMsg(`Trying Invidious…`);
+    setMsg(`Trying fallback server…`);
     r=await tryInvidious(q,inst,diag);
     if(r)return finish(r,'invidious',diag);
   }
@@ -238,6 +230,22 @@ function finish(videos,method,diag){
   renderResults(videos,method);
 }
 
+// ── Method 0: Cloudflare Worker ───────────────────────────────────────────────
+async function tryWorker(query,diag){
+  const url=`${WORKER_URL}/?q=${encodeURIComponent(query)}`;
+  const a={method:'worker',url,ok:false,error:null,status:null,timing:null};
+  diag.attempts.push(a);const t0=performance.now();
+  try{
+    const res=await fetch(url,{signal:AbortSignal.timeout(8000)});
+    a.status=res.status;a.timing=ms(t0);
+    if(!res.ok){a.error=`HTTP ${res.status}`;return null;}
+    let data;try{data=await res.json();}catch{a.error='JSON parse fail';return null;}
+    const v=parseYt(data);
+    if(!v.length){a.error='0 results';return null;}
+    a.ok=true;return v;
+  }catch(e){a.error=e.message;a.timing=ms(t0);return null;}
+}
+
 // ── Method 1: Direct ──────────────────────────────────────────────────────────
 async function tryDirect(query,diag){
   const a={method:'direct',url:'https://www.youtube.com/youtubei/v1/search',ok:false,error:null,status:null,timing:null};
@@ -252,24 +260,7 @@ async function tryDirect(query,diag){
   }catch(e){a.error=e.message;a.timing=ms(t0);return null;}
 }
 
-// ── Method 2: CORS proxy → youtubei ──────────────────────────────────────────
-async function tryYtProxy(query,proxy,diag){
-  const target='https://www.youtube.com/youtubei/v1/search';
-  const {url,headers}=proxy.fn(target);
-  const a={method:'proxy:'+proxy.name,url,ok:false,error:null,status:null,timing:null};
-  diag.attempts.push(a);const t0=performance.now();
-  try{
-    const res=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json',...headers},body:ytBody(query),signal:AbortSignal.timeout(8000)});
-    a.status=res.status;a.timing=ms(t0);
-    if(!res.ok){a.error=`HTTP ${res.status}`;return null;}
-    let data;try{data=await res.json();}catch{a.error='JSON parse fail';return null;}
-    const v=parseYt(data);
-    if(!v.length){a.error='0 results';return null;}
-    a.ok=true;return v;
-  }catch(e){a.error=e.message;a.timing=ms(t0);return null;}
-}
-
-// ── Method 3: Invidious GET API ───────────────────────────────────────────────
+// ── Method 2: Invidious GET API ───────────────────────────────────────────────
 async function tryInvidious(query,instance,diag){
   const url=`${instance}/api/v1/search?q=${encodeURIComponent(query)}&type=video&fields=videoId,title,author,videoThumbnails,lengthSeconds`;
   const a={method:'invidious:'+instance.split('//')[1],url,ok:false,error:null,status:null,timing:null};
@@ -349,8 +340,8 @@ function fmtDur(s){const m=Math.floor(s/60),sec=s%60;return`${m}:${String(sec).p
 function renderResults(videos,method){
   const grid=document.getElementById('resultsGrid');
   grid.innerHTML='';
-  const labels={direct:'Direct · YouTube API',proxy:'Via CORS proxy',invidious:'Via Invidious',suggest:'YouTube suggestions (limited)'};
-  const cls=method==='direct'?'direct':method==='suggest'?'suggest':'proxy';
+  const labels={worker:'Your search proxy · YouTube API',direct:'Direct · YouTube API',proxy:'Via CORS proxy',invidious:'Via Invidious',suggest:'YouTube suggestions (limited)'};
+  const cls=method==='worker'||method==='direct'?'direct':method==='suggest'?'suggest':'proxy';
   const badge=document.createElement('div');
   badge.className=`method-badge ${cls}`;
   badge.innerHTML=`<span class="method-dot"></span>${labels[method]||method} · ${videos.length} results`;
@@ -380,7 +371,7 @@ function renderError(diag){
       <button class="copy-diag" onclick="copyDiag()">Copy debug info</button>
     </div>
     <div class="errbox-body">
-      <div class="errbox-msg">Tried direct YouTube API, ${PROXIES.length} CORS proxies, ${INVIDIOUS.length} Invidious instances, and JSONP suggestions. All failed.</div>
+      <div class="errbox-msg">Tried your Cloudflare Worker, direct YouTube API, ${INVIDIOUS.length} Invidious instances, and JSONP suggestions. All failed. Your worker may be down — check workers.cloudflare.com.</div>
       <div class="diag-section">
         <div class="diag-label">Attempt log</div>
         ${diag.attempts.map(a=>`<div class="diag-row"><span class="diag-key">${esc(a.method)}</span><span class="diag-val ${a.ok?'ok':'bad'}">${a.ok?'✓':('✗ '+esc(a.error||'?'))} ${a.status?'['+a.status+']':''} ${a.timing!=null?'('+a.timing+'ms)':''}</span></div>`).join('')}
